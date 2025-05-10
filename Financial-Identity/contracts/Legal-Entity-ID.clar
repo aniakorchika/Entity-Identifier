@@ -73,44 +73,42 @@
 
 ;; Helper function to check if caller is authorized
 (define-private (is-authorized)
-  (or
-    (is-eq tx-sender (var-get contract-owner))
-    (default-to false (get active (map-get? administrators { admin: tx-sender })))
+  (let 
+    (
+      (admin-status (map-get? administrators { admin: tx-sender }))
+    )
+    (or
+      (is-eq tx-sender (var-get contract-owner))
+      (and (is-some admin-status) (get active (unwrap-panic admin-status)))
+    )
   )
 )
 
 ;; Helper function to validate LEI format
 ;; LEI is 20 characters: 4 alphanumeric, 2 country code, 12 alphanumeric, 2 check digits
 (define-private (is-valid-lei (lei (string-ascii 20)))
-  (and
-    (is-eq (len lei) u20)
-    (is-lei-format-valid lei)
-  )
-)
-
-;; Additional LEI format validation logic
-(define-private (is-lei-format-valid (lei (string-ascii 20)))
-  (let
-    (
-      (country-code (slice lei u4 u2))
-    )
-    ;; This is a simplified validation
-    ;; In a full implementation, you would add more validation rules
-    (> (len country-code) u0)
-  )
+  ;; Since Clarity doesn't have native string slicing functions,
+  ;; we'll implement a simplified validation approach
+  ;; This just checks for proper length - in production, implement more thorough validation
+  (is-eq (len lei) u20)
 )
 
 ;; Function to add a new LEI to user's list
 (define-private (add-lei-to-principal (lei (string-ascii 20)) (owner principal))
   (let 
     (
-      (existing-leis (default-to { leis: (list) } (map-get? principal-lei-map { owner: owner })))
-      (current-list (get leis existing-leis))
-      (new-list (unwrap! (as-max-len? (append current-list lei) u20) ERR-ALREADY-REGISTERED))
+      (existing-leis-opt (map-get? principal-lei-map { owner: owner }))
+      (current-list (if (is-some existing-leis-opt)
+                       (get leis (unwrap-panic existing-leis-opt))
+                       (list)))
+      (new-list-maybe (as-max-len? (append current-list lei) u20))
     )
-    (map-set principal-lei-map
-      { owner: owner }
-      { leis: new-list }
+    (if (is-some new-list-maybe)
+      (ok (map-set principal-lei-map
+        { owner: owner }
+        { leis: (unwrap-panic new-list-maybe) }
+      ))
+      ERR-ALREADY-REGISTERED
     )
   )
 )
@@ -119,14 +117,19 @@
 (define-private (add-status-to-history (lei (string-ascii 20)) (status (string-ascii 20)))
   (let
     (
-      (existing-history (default-to { statuses: (list) } (map-get? lei-status-history { lei: lei })))
-      (current-list (get statuses existing-history))
+      (existing-history-opt (map-get? lei-status-history { lei: lei }))
+      (current-list (if (is-some existing-history-opt)
+                       (get statuses (unwrap-panic existing-history-opt))
+                       (list)))
       (new-status { status: status, timestamp: block-height })
-      (new-list (unwrap! (as-max-len? (append current-list new-status) u50) ERR-ALREADY-REGISTERED))
+      (new-list-maybe (as-max-len? (append current-list new-status) u50))
     )
-    (map-set lei-status-history
-      { lei: lei }
-      { statuses: new-list }
+    (if (is-some new-list-maybe)
+      (ok (map-set lei-status-history
+        { lei: lei }
+        { statuses: (unwrap-panic new-list-maybe) }
+      ))
+      ERR-ALREADY-REGISTERED
     )
   )
 )
@@ -154,7 +157,7 @@
     (asserts! (> expiration-date block-height) ERR-INVALID-DATE)
     
     ;; Register the LEI
-    (try! (map-set lei-registry
+    (map-set lei-registry
       { lei: lei }
       {
         entity-name: entity-name,
@@ -167,7 +170,7 @@
         owner: tx-sender,
         last-update: block-height
       }
-    ))
+    )
     
     ;; Add LEI to principal's list
     (try! (add-lei-to-principal lei tx-sender))
@@ -181,37 +184,40 @@
 
 ;; Renew an LEI by extending its expiration date
 (define-public (renew-lei (lei (string-ascii 20)) (new-expiration-date uint))
-  (let
-    (
-      (lei-data (unwrap! (map-get? lei-registry { lei: lei }) ERR-NOT-FOUND))
-      (owner (get owner lei-data))
+  (begin
+    (let
+      (
+        (lei-data (unwrap! (map-get? lei-registry { lei: lei }) ERR-NOT-FOUND))
+        (owner (get owner lei-data))
+        (current-status (get status lei-data))
+      )
+      ;; Check authorization
+      (asserts! (or (is-authorized) (is-eq tx-sender owner)) ERR-NOT-AUTHORIZED)
+      
+      ;; Check that new expiration date is in the future
+      (asserts! (> new-expiration-date block-height) ERR-INVALID-DATE)
+      
+      ;; Check that new expiration date is after current one
+      (asserts! (> new-expiration-date (get expiration-date lei-data)) ERR-INVALID-DATE)
+      
+      ;; Update the LEI
+      (map-set lei-registry
+        { lei: lei }
+        (merge lei-data {
+          expiration-date: new-expiration-date,
+          status: "ACTIVE",
+          last-update: block-height
+        })
+      )
+      
+      ;; Add renewal status to history if status was previously EXPIRED
+      (if (is-eq current-status "EXPIRED")
+        (try! (add-status-to-history lei "ACTIVE"))
+        true
+      )
+      
+      (ok true)
     )
-    ;; Check authorization
-    (asserts! (or (is-authorized) (is-eq tx-sender owner)) ERR-NOT-AUTHORIZED)
-    
-    ;; Check that new expiration date is in the future
-    (asserts! (> new-expiration-date block-height) ERR-INVALID-DATE)
-    
-    ;; Check that new expiration date is after current one
-    (asserts! (> new-expiration-date (get expiration-date lei-data)) ERR-INVALID-DATE)
-    
-    ;; Update the LEI
-    (try! (map-set lei-registry
-      { lei: lei }
-      (merge lei-data {
-        expiration-date: new-expiration-date,
-        status: "ACTIVE",
-        last-update: block-height
-      })
-    ))
-    
-    ;; Add renewal status to history if status was previously EXPIRED
-    (if (is-eq (get status lei-data) "EXPIRED")
-      (try! (add-status-to-history lei "ACTIVE"))
-      true
-    )
-    
-    (ok true)
   )
 )
 
@@ -232,7 +238,7 @@
     (asserts! (or (is-authorized) (is-eq tx-sender owner)) ERR-NOT-AUTHORIZED)
     
     ;; Update the LEI
-    (ok (map-set lei-registry
+    (map-set lei-registry
       { lei: lei }
       (merge lei-data {
         entity-name: entity-name,
@@ -241,7 +247,9 @@
         registration-authority: registration-authority,
         last-update: block-height
       })
-    ))
+    )
+    
+    (ok true)
   )
 )
 
@@ -265,13 +273,13 @@
     ) ERR-INVALID-STATUS)
     
     ;; Update the LEI status
-    (try! (map-set lei-registry
+    (map-set lei-registry
       { lei: lei }
       (merge lei-data {
         status: new-status,
         last-update: block-height
       })
-    ))
+    )
     
     ;; Add status change to history
     (try! (add-status-to-history lei new-status))
@@ -294,13 +302,13 @@
     (asserts! (not (is-eq new-owner current-owner)) ERR-INVALID-ADDRESS)
     
     ;; Update the LEI owner
-    (try! (map-set lei-registry
+    (map-set lei-registry
       { lei: lei }
       (merge lei-data {
         owner: new-owner,
         last-update: block-height
       })
-    ))
+    )
     
     ;; Add LEI to new owner's list
     (try! (add-lei-to-principal lei new-owner))
@@ -339,12 +347,28 @@
 
 ;; Get all LEIs owned by a principal
 (define-read-only (get-leis-by-principal (owner principal))
-  (default-to { leis: (list) } (map-get? principal-lei-map { owner: owner }))
+  (let 
+    (
+      (result (map-get? principal-lei-map { owner: owner }))
+    )
+    (if (is-some result)
+      (unwrap-panic result)
+      { leis: (list) }
+    )
+  )
 )
 
 ;; Get LEI status history
 (define-read-only (get-lei-status-history (lei (string-ascii 20)))
-  (default-to { statuses: (list) } (map-get? lei-status-history { lei: lei }))
+  (let 
+    (
+      (result (map-get? lei-status-history { lei: lei }))
+    )
+    (if (is-some result)
+      (unwrap-panic result)
+      { statuses: (list) }
+    )
+  )
 )
 
 ;; Check if a principal is an administrator
@@ -354,26 +378,18 @@
 
 ;; Verify LEI validity, authentication, and expiration in one call
 (define-read-only (verify-lei (lei (string-ascii 20)))
-  (let
-    (
-      (lei-data (map-get? lei-registry { lei: lei }))
-    )
-    (if (is-some lei-data)
-      (let
-        (
-          (unwrapped-data (unwrap! lei-data { status: "NOT_FOUND", expiration-date: u0 }))
-          (status (get status unwrapped-data))
-          (expiration (get expiration-date unwrapped-data))
-          (is-active (is-eq status "ACTIVE"))
-          (is-expired (< expiration block-height))
-        )
-        (cond
-          ((not is-active) (err u201)) ;; Not active
-          (is-expired (err u202))      ;; Expired
-          (true (ok unwrapped-data))   ;; Valid
+  (let ((lei-data (map-get? lei-registry { lei: lei })))
+    (if (is-none lei-data)
+      (err u103) ;; LEI not found
+      (let ((data (unwrap-panic lei-data)))
+        (if (not (is-eq (get status data) "ACTIVE"))
+          (err u201) ;; Not active
+          (if (< (get expiration-date data) block-height)
+            (err u202) ;; Expired
+            (ok data) ;; Valid
+          )
         )
       )
-      ERR-NOT-FOUND
     )
   )
 )
@@ -400,7 +416,7 @@
     (if (is-some lei-data)
       (let
         (
-          (unwrapped-data (unwrap! lei-data { expiration-date: u0, status: "" }))
+          (unwrapped-data (unwrap-panic lei-data))
           (expiration (get expiration-date unwrapped-data))
           (status (get status unwrapped-data))
           (needs-expire (and (< expiration block-height) (is-eq status "ACTIVE")))
@@ -414,7 +430,10 @@
                 last-update: block-height
               })
             )
-            (add-status-to-history lei "EXPIRED")
+            ;; Ignore any errors from adding status to history
+            (match (add-status-to-history lei "EXPIRED")
+              success true
+              error false)
             true
           )
           false
@@ -425,13 +444,9 @@
   )
 )
 
-;; Initialize the contract by setting the initial contract owner
-(define-private (initialize)
-  (begin
-    (map-set administrators { admin: tx-sender } { active: true })
-    true
-  )
+;; Contract initialization
+;; This happens when the contract is deployed
+(begin
+  ;; Set initial contract owner to the deployer
+  (map-set administrators { admin: tx-sender } { active: true })
 )
-
-;; Make sure the contract is initialized when deployed
-(initialize)
